@@ -12,6 +12,7 @@ import (
 type Client struct {
 	checkURL string
 	hamURL   string
+	spamURL  string
 	logger   *slog.Logger
 	password string
 }
@@ -20,6 +21,7 @@ func New(logger *slog.Logger, url, password string) *Client {
 	return &Client{
 		checkURL: url + "/checkv2",
 		hamURL:   url + "/learnham",
+		spamURL:  url + "/learnspam",
 		logger:   logger.WithGroup("rspamc").With("server", url),
 		password: password,
 	}
@@ -101,6 +103,23 @@ func (c *Client) Ham(ctx context.Context, msg io.Reader) error {
 
 	// It is also unsuccessful if the same message has already learned
 	// before
+	// if !resp.Success {
+	// 	return errors.New("unsuccessful")
+	// }
+
+	return nil
+}
+
+func (c *Client) Spam(ctx context.Context, msg io.Reader) error {
+	var resp learnHamReponse // Assuming learnSpamResponse is similar to learnHamReponse
+
+	err := c.sendRequest(ctx, c.spamURL, msg, &resp)
+	if err != nil {
+		return err
+	}
+
+	// Similar to Ham, we can check resp.Success if needed,
+	// but for now, we'll keep it simple.
 	// if !resp.Success {
 	// 	return errors.New("unsuccessful")
 	// }

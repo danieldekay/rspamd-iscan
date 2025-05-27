@@ -30,8 +30,13 @@ InboxMailbox   ="INBOX"
 SpamMailbox    ="Spam"
 HamMailbox     = "Ham"
 ScanMailbox    ="Unscanned"
+# Optional: Folder from which messages are taken, learned as spam,
+# and then moved to SpamMailbox. If not set or empty, this feature is disabled.
+LearnSpamMailbox = "LearnSpam"
 SpamThreshold = 10.0
 ```
+
+-   `LearnSpamMailbox`: (Optional) Specifies an IMAP mailbox from which messages are fetched, learned by Rspamd as spam, and then moved to the `SpamMailbox`. If this option is not set or is an empty string, this feature is disabled.
 
 The location of the configuration and state file can be specified via command
 line parameters.

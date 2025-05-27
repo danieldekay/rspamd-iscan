@@ -28,10 +28,11 @@ type Client struct {
 
 	spamMailbox   string
 	hamMailbox    string
-	scanMailbox   string
-	inboxMailbox  string
-	statefilePath string
-	spamTreshold  float32
+	scanMailbox      string
+	inboxMailbox     string
+	learnSpamMailbox string
+	statefilePath    string
+	spamTreshold     float32
 
 	hamLearnCheckInterval time.Duration
 
@@ -42,7 +43,7 @@ type Client struct {
 
 func NewClient(
 	addr, user, passwd,
-	scanMailbox, inboxName, hamMailbox, spamMailboxName string,
+	scanMailbox, inboxName, hamMailbox, spamMailboxName, learnSpamMailbox string,
 	statefilePath string,
 	spamTreshold float32,
 	logger *slog.Logger,
@@ -55,6 +56,7 @@ func NewClient(
 		scanMailbox:           scanMailbox,
 		spamMailbox:           spamMailboxName,
 		hamMailbox:            hamMailbox,
+		learnSpamMailbox:      learnSpamMailbox,
 		eventCh:               make(chan eventNewMessages, defChanBufSiz),
 		rspamc:                rspamc,
 		statefilePath:         statefilePath,
@@ -182,6 +184,12 @@ func (c *Client) loadOrCreateState() (*state, error) {
 		result.Seen[c.scanMailbox] = &SeenStatus{}
 	}
 
+	if c.learnSpamMailbox != "" {
+		if _, exists := result.Seen[c.learnSpamMailbox]; !exists {
+			result.Seen[c.learnSpamMailbox] = &SeenStatus{}
+		}
+	}
+
 	return &result, nil
 }
 
@@ -272,6 +280,122 @@ func (c *Client) ProcessHam() error {
 	}
 
 	logger.Info("moved messages to inbox", "mailbox.destination", c.inboxMailbox)
+
+	return nil
+}
+
+func (c *Client) ProcessLearnSpam() error {
+	if c.learnSpamMailbox == "" {
+		c.logger.Debug("learnSpamMailbox is not configured, skipping")
+		return nil
+	}
+	logger := c.logger.With("mailbox.source", c.learnSpamMailbox)
+
+	logger.Debug("checking for new messages to learn as spam")
+
+	mbox, err := c.clt.Select(c.learnSpamMailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return fmt.Errorf("selecting learnSpamMailbox %q failed: %w", c.learnSpamMailbox, err)
+	}
+
+	if mbox.NumMessages == 0 {
+		logger.Debug("learnSpamMailbox is empty, nothing todo", "event", "imap.mailbox_empty")
+		return nil
+	}
+
+	logger.Debug("new messages found", "event", "imap.new_messages", "count", mbox.NumMessages)
+
+	// Fetch all messages in the mailbox.
+	// Unlike scanMailbox, we don't need to track UIDLastProcessed for learnSpamMailbox
+	// as we process all messages and then move them.
+	n := imap.SeqSet{}
+	n.AddRange(1, 0) // 0 means all messages from 1 to N.
+
+	fetchCmd := c.clt.Fetch(n, &imap.FetchOptions{
+		Envelope:    true,
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{{}}, // Fetch the entire message body
+	})
+	defer fetchCmd.Close()
+
+	var learnedSpamSet imap.UIDSet
+	for {
+		msgData := fetchCmd.Next()
+		if msgData == nil {
+			logger.Debug("no more messages to fetch from learnSpamMailbox")
+			break
+		}
+
+		msg, err := msgData.Collect()
+		if err != nil {
+			// Log error and continue with other messages if possible, or return.
+			// For simplicity, returning error for now.
+			logger.Error("collecting message data failed", "error", err)
+			return fmt.Errorf("collecting message data from learnSpamMailbox failed: %w", err)
+		}
+
+		if msg.Envelope == nil {
+			logger.Error("msg.Envelope is nil in learnSpamMailbox")
+			// Potentially skip this message or return error
+			continue // Skip this message
+		}
+		if msg.UID == 0 {
+			logger.Error("msg.UID is 0 in learnSpamMailbox")
+			// Potentially skip this message or return error
+			continue // Skip this message
+		}
+
+		msgLogger := logger.With("mail.subject", msg.Envelope.Subject, "mail.uid", msg.UID)
+		msgLogger.Debug("fetched message from learnSpamMailbox")
+
+		if len(msg.BodySection) != 1 {
+			msgLogger.Error("message has unexpected number of body sections", "count", len(msg.BodySection))
+			continue // Skip this message
+		}
+		var txt []byte
+		for _, b := range msg.BodySection {
+			txt = b
+			break
+		}
+		if txt == nil {
+			msgLogger.Error("message body is nil")
+			continue
+		}
+		if len(txt) == 0 {
+			msgLogger.Error("message body is empty")
+			continue
+		}
+
+		err = c.rspamc.Spam(context.TODO(), bytes.NewReader(txt))
+		if err != nil {
+			// Log the error but continue processing other messages.
+			// We don't want one failed learn attempt to stop others.
+			msgLogger.Error("failed to learn message as spam", "error", err)
+			// Optionally, decide if certain errors are fatal and should return.
+			// For now, just log and continue.
+		} else {
+			msgLogger.Info("learned message as spam successfully")
+			learnedSpamSet.AddNum(msg.UID)
+		}
+	}
+
+	if err := fetchCmd.Close(); err != nil {
+		logger.Error("fetch command for learnSpamMailbox failed on close", "error", err)
+		// Decide if we should attempt to move already processed messages or return.
+		// Returning the error for now.
+		return fmt.Errorf("fetch command for learnSpamMailbox failed: %w", err)
+	}
+
+	if len(learnedSpamSet) > 0 {
+		// Move successfully learned messages to the main spam mailbox
+		_, err = c.clt.Move(learnedSpamSet, c.spamMailbox).Wait()
+		if err != nil {
+			return fmt.Errorf("moving messages from learnSpamMailbox to spamMailbox %q failed: %w", c.spamMailbox, err)
+		}
+		logger.Info("moved learned spam messages to spam mailbox", "mailbox.destination", c.spamMailbox, "count", len(learnedSpamSet))
+	} else {
+		logger.Debug("no messages were learned as spam or moved from learnSpamMailbox")
+	}
 
 	return nil
 }
@@ -437,6 +561,11 @@ func (c *Client) Run() error {
 		return fmt.Errorf("learning ham failed: %w", err)
 	}
 
+	err = c.ProcessLearnSpam()
+	if err != nil {
+		return fmt.Errorf("learning spam failed: %w", err)
+	}
+
 	seen, err := c.ProcessScanBox(lastSeen.Seen[c.scanMailbox])
 	lastSeen.Seen[c.scanMailbox] = seen
 	if err := c.writeStateFile(lastSeen); err != nil {
@@ -482,6 +611,10 @@ func (c *Client) Run() error {
 				if err := c.ProcessHam(); err != nil {
 					return err
 				}
+				if err := c.ProcessLearnSpam(); err != nil {
+					// Log or handle as appropriate, maybe not fatal
+					c.logger.Error("processing learn spam mailbox failed during periodic check", "error", err)
+				}
 				lastHamLearn = time.Now()
 			}
 
@@ -504,6 +637,10 @@ func (c *Client) Run() error {
 			if time.Since(lastHamLearn) >= c.hamLearnCheckInterval {
 				if err := c.ProcessHam(); err != nil {
 					return err
+				}
+				if err := c.ProcessLearnSpam(); err != nil {
+					// Log or handle as appropriate
+					c.logger.Error("processing learn spam mailbox failed after event", "error", err)
 				}
 				lastHamLearn = time.Now()
 			}

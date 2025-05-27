@@ -26,9 +26,10 @@ type Config struct {
 	ImapPassword   string
 	InboxMailbox   string
 	SpamMailbox    string
-	ScanMailbox    string
-	HamMailbox     string
-	SpamThreshold  float32
+	ScanMailbox      string
+	HamMailbox       string
+	LearnSpamMailbox string
+	SpamThreshold    float32
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -91,6 +92,7 @@ func main() {
 			cfg.InboxMailbox,
 			cfg.HamMailbox,
 			cfg.SpamMailbox,
+			cfg.LearnSpamMailbox,
 			*stateFilePath,
 			cfg.SpamThreshold,
 			logger,
