@@ -13,6 +13,18 @@ scanned periodically. \
 All mails in _HamMailbox_ are fed as Ham to rspamd and then moved to
 _InboxMailbox_. The _HamMailbox_ is only processed periodically.
 
+### Detailed Scan Processing and Header Modification
+
+When messages are processed from the `ScanMailbox`:
+
+-   If a message receives a spam score that is greater than 0 but less than the configured `SpamThreshold` (i.e., it's considered ham but did exhibit some spam characteristics):
+    -   Rspamd diagnostic headers are added directly into the email's existing headers. These include headers like `X-Spam-Flag`, `X-Rspamd-Score`, `X-Spamd-Bar`, `X-Rspamd-Symbols`, and `X-Rspamd-Action`.
+    -   This modified email (with the new headers) is then appended to the `InboxMailbox`.
+    -   The original email from the `ScanMailbox` is subsequently deleted.
+    -   This feature allows users to see detailed Rspamd processing information directly within emails that were borderline or had some spam characteristics but were ultimately classified as ham.
+-   Messages with a spam score of 0 or less are moved to the `InboxMailbox` without any modification or header addition by `rspamd-iscan`.
+-   Messages with a spam score equal to or greater than the `SpamThreshold` are moved to the `SpamMailbox`. These messages are not modified with additional headers by `rspamd-iscan` during this process (though Rspamd itself might add headers based on its own configuration for such actions).
+
 The mails that have been scanned last are stored in a state file.
 
 ## Configuration

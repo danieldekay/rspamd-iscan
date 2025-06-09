@@ -53,18 +53,34 @@ type MockImapClient struct {
 	FetchFunc  func(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand
 	MoveFunc   func(numSet imap.UIDSet, dest string) *imapclient.MoveCommand
 	IdleFunc   func() (*imapclient.IdleCommand, error)
-	LoginFunc  func(username string, password string) *imapclient.Command // Not strictly needed for ProcessLearnSpam but good for NewClient
-	CloseFunc  func() error // Not strictly needed for ProcessLearnSpam
-	
+	LoginFunc  func(username string, password string) *imapclient.Command
+	CloseFunc  func() error
+	AppendFunc func(mailbox string, size uint32, options *imap.AppendOptions) *imapclient.AppendCommand
+	StoreFunc  func(uidSet imap.UIDSet, flags imap.StoreFlagsOp, newFlags []imap.Flag, options *imap.StoreOptions) *imapclient.StoreCommand
+	ExpungeFunc func(uidSet *imap.UIDSet) *imapclient.ExpungeCommand
+
 	// Store calls to verify
-	SelectedMailbox string
-	FetchedNumSet   imap.NumSet
-	MovedUIDSet     imap.UIDSet
-	MovedDest       string
+	SelectedMailbox     string
+	SelectedReadOnlyOpt bool
+	FetchedNumSet       imap.NumSet
+	FetchedItems        []imap.FetchItem // To verify what was fetched, e.g. RFC822
+	MovedUIDSet         imap.UIDSet
+	MovedDest           string
+	AppendedToMailbox   string
+	AppendedMessage     []byte
+	StoredUIDSet        imap.UIDSet
+	StoredFlagsOp       imap.StoreFlagsOp
+	StoredNewFlags      []imap.Flag
+	ExpungedUIDSet      *imap.UIDSet // Pointer to distinguish from empty set if nil means all
 }
 
 func (m *MockImapClient) Select(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
 	m.SelectedMailbox = mailbox
+	if options != nil {
+		m.SelectedReadOnlyOpt = options.ReadOnly
+	} else {
+		m.SelectedReadOnlyOpt = false // Default for Select if options is nil
+	}
 	if m.SelectFunc != nil {
 		return m.SelectFunc(mailbox, options)
 	}
@@ -72,13 +88,16 @@ func (m *MockImapClient) Select(mailbox string, options *imap.SelectOptions) *im
 	cmd := imapclient.NewSelectCommand(&imap.SelectData{NumMessages: 0})
 	go func() {
 		cmd.SetData(&imap.SelectData{NumMessages: 0}) // Ensure data is set before Wait() can be called
-		cmd.Close() 
+		cmd.Close()
 	}()
 	return cmd
 }
 
 func (m *MockImapClient) Fetch(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand {
 	m.FetchedNumSet = numSet
+	if options != nil && len(options.Items) > 0 {
+		m.FetchedItems = options.Items
+	}
 	if m.FetchFunc != nil {
 		return m.FetchFunc(numSet, options)
 	}
@@ -116,7 +135,7 @@ func (m *MockImapClient) Login(username string, password string) *imapclient.Com
     }
     cmd := imapclient.NewCommand(nil) // Pass nil as client
     go func() {
-        cmd.Close() 
+        cmd.Close()
     }()
     return cmd
 }
@@ -128,18 +147,87 @@ func (m *MockImapClient) Close() error {
     return nil
 }
 
+func (m *MockImapClient) Append(mailbox string, size uint32, options *imap.AppendOptions) *imapclient.AppendCommand {
+	m.AppendedToMailbox = mailbox
+	// The actual message bytes are written to the command, so we need to capture them there.
+	// For now, this mock just signals the call. The test will provide a command that captures bytes.
+	if m.AppendFunc != nil {
+		return m.AppendFunc(mailbox, size, options)
+	}
+	cmd := imapclient.NewAppendCommand(nil, mailbox, size, options) // Pass nil client
+	// In a real scenario, the caller writes to cmd.Cmd.
+	// For the mock, the test should provide a cmd that captures the write.
+	go func() {
+		cmd.Close()
+	}()
+	return cmd
+}
+
+func (m *MockImapClient) Store(uidSet imap.UIDSet, flags imap.StoreFlagsOp, newFlags []imap.Flag, options *imap.StoreOptions) *imapclient.StoreCommand {
+	m.StoredUIDSet = uidSet
+	m.StoredFlagsOp = flags
+	m.StoredNewFlags = newFlags
+	if m.StoreFunc != nil {
+		return m.StoreFunc(uidSet, flags, newFlags, options)
+	}
+	cmd := imapclient.NewStoreCommand(nil, uidSet, flags, newFlags, options)
+	go func() {
+		cmd.Close()
+	}()
+	return cmd
+}
+
+func (m *MockImapClient) Expunge(uidSet *imap.UIDSet) *imapclient.ExpungeCommand {
+	m.ExpungedUIDSet = uidSet
+	if m.ExpungeFunc != nil {
+		return m.ExpungeFunc(uidSet)
+	}
+	cmd := imapclient.NewExpungeCommand(nil, uidSet)
+	go func() {
+		cmd.SetData(&imap.ExpungeData{}) // Empty data
+		cmd.Close()
+	}()
+	return cmd
+}
+
+
 // --- Helper to create a Client with mocks ---
-func newTestClient(mockImapClt *MockImapClient, mockRspamcClt *MockRspamcClient, learnSpamMailbox string) *Client {
+func newTestClientWithConfig(mockImapClt *MockImapClient, mockRspamcClt *MockRspamcClient, cfg ClientConfig) *Client {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &Client{
 		clt:                   mockImapClt,
 		logger:                logger,
 		rspamc:                mockRspamcClt,
-		learnSpamMailbox:      learnSpamMailbox,
-		spamMailbox:           "Spam", // Default for testing move operations
-		hamLearnCheckInterval: 30 * time.Minute, // Default, not relevant for this specific test
-		eventCh:               make(chan eventNewMessages, 1), // Default
+		scanMailbox:           cfg.ScanMailbox,
+		inboxMailbox:          cfg.InboxMailbox,
+		spamMailbox:           cfg.SpamMailbox,
+		learnSpamMailbox:      cfg.LearnSpamMailbox,
+		hamMailbox:            cfg.HamMailbox,
+		spamTreshold:          cfg.SpamThreshold,
+		statefilePath:         cfg.StatefilePath, // Needed for ProcessScanBox if it writes state
+		hamLearnCheckInterval: 30 * time.Minute,
+		eventCh:               make(chan eventNewMessages, 1),
 	}
+}
+
+// Simpler helper for tests not needing full config
+func newTestClient(mockImapClt *MockImapClient, mockRspamcClt *MockRspamcClient, learnSpamMailbox string) *Client {
+	return newTestClientWithConfig(mockImapClt, mockRspamcClt, ClientConfig{
+		LearnSpamMailbox: learnSpamMailbox,
+		SpamMailbox:      "Spam", // Default for some existing tests
+		ScanMailbox:      "Scan", // Default for ProcessScanBox tests
+		InboxMailbox:     "Inbox",
+	})
+}
+
+type ClientConfig struct {
+	ScanMailbox      string
+	InboxMailbox     string
+	SpamMailbox      string
+	LearnSpamMailbox string
+	HamMailbox       string
+	SpamThreshold    float32
+	StatefilePath    string
 }
 
 // --- Tests ---
@@ -172,7 +260,7 @@ func TestProcessLearnSpam(t *testing.T) {
 	t.Run("learnSpamMailbox is empty (no messages)", func(t *testing.T) {
 		mockImap := &MockImapClient{}
 		mockRspamc := &MockRspamcClient{}
-		
+
 		mockImap.SelectFunc = func(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
 			if mailbox != "LearnSpamFolder" {
 				t.Errorf("expected selection of 'LearnSpamFolder', got '%s'", mailbox)
@@ -208,7 +296,7 @@ func TestProcessLearnSpam(t *testing.T) {
 	t.Run("success path (fetch, learn, move)", func(t *testing.T) {
 		mockImap := &MockImapClient{}
 		mockRspamc := &MockRspamcClient{}
-		
+
 		var spamFuncCalled bool
 		var movedUIDs imap.UIDSet
 		var movedToMailbox string
@@ -280,7 +368,7 @@ func TestProcessLearnSpam(t *testing.T) {
 		if !spamFuncCalled {
 			t.Error("Rspamc.Spam was not called")
 		}
-		
+
 		expectedMovedUIDs := imap.UIDSet{}
 		expectedMovedUIDs.AddNum(123)
 		if !reflect.DeepEqual(movedUIDs, expectedMovedUIDs) {
@@ -294,7 +382,7 @@ func TestProcessLearnSpam(t *testing.T) {
 	t.Run("rspamc.Spam fails for a message", func(t *testing.T) {
 		mockImap := &MockImapClient{}
 		mockRspamc := &MockRspamcClient{}
-		
+
 		var spamFuncCalled bool
 		var moveAttempted bool
 
@@ -383,7 +471,7 @@ func TestProcessLearnSpam(t *testing.T) {
 
 		client := newTestClient(mockImap, mockRspamc, "LearnSpamMoveFail")
 		err := client.ProcessLearnSpam()
-		
+
 		if err == nil {
 			t.Fatal("expected an error from ProcessLearnSpam due to move failure, got nil")
 		}
@@ -401,6 +489,376 @@ func TestProcessLearnSpam(t *testing.T) {
 // (which it isn't for UID tracking like scanMailbox).
 // The current ProcessLearnSpam doesn't use UIDLastProcessed for the learnSpamMailbox,
 // so state interaction is minimal for this specific method beyond its existence.
+
+
+// Helper to parse email bytes and check headers
+func emailContainsHeaders(t *testing.T, rawEmail []byte, expectedHeaders map[string]string) bool {
+	t.Helper()
+	// We need to import "github.com/emersion/go-message" for this.
+	// Ensure it's added to the imports of client_test.go
+	// For now, this is a placeholder. The actual implementation needs message.Read
+	r := bytes.NewReader(rawEmail)
+	m, err := message.Read(r)
+	if err != nil {
+		t.Errorf("emailContainsHeaders: failed to parse raw email: %v", err)
+		return false
+	}
+
+	allFound := true
+	for key, expectedValue := range expectedHeaders {
+		actualValue := m.Header.Get(key)
+		if actualValue != expectedValue {
+			t.Errorf("emailContainsHeaders: for header '%s', expected '%s', got '%s'", key, expectedValue, actualValue)
+			allFound = false
+		}
+	}
+	return allFound
+}
+
+
+func TestProcessScanBox(t *testing.T) {
+	defaultInitialState := &SeenStatus{UIDValidity: 1, UIDLastProcessed: 0}
+	defaultRawEmail := []byte("From: sender@example.com\nTo: recipient@example.com\nSubject: Test Email\n\nThis is a test email.")
+
+	// Mocked AppendCommand to capture written data
+	type mockAppendCmd struct {
+		*imapclient.AppendCommand
+		writtenData bytes.Buffer
+		closeErr    error
+		waitErr     error
+	}
+	func (m *mockAppendCmd) Write(p []byte) (n int, err error) { return m.writtenData.Write(p) }
+	func (m *mockAppendCmd) Close() error                      { return m.closeErr }
+	func (m *mockAppendCmd) Wait() error                       { return m.waitErr }
+
+
+	tests := []struct {
+		name                string
+		initialState        *SeenStatus
+		spamThreshold       float32
+		mockRspamcResult    *rspamc.Result
+		mockRspamcError     error
+		setupImapMock       func(t *testing.T, mockImap *MockImapClient, mockRspamcResult *rspamc.Result, expectedRawEmail []byte) *mockAppendCmd // Returns the mockAppendCmd for inspection
+		validateImapMock    func(t *testing.T, mockImap *MockImapClient, appendedCmd *mockAppendCmd, expectedRspamcResult *rspamc.Result)
+		expectedError       bool
+		expectedFinalUID    imap.UID
+	}{
+		{
+			name:             "Score > 0, < Threshold (Headers Added, Append, Delete)",
+			initialState:     &SeenStatus{UIDValidity: 1, UIDLastProcessed: 0},
+			spamThreshold:    5.0,
+			mockRspamcResult: &rspamc.Result{Score: 2.0, Action: "add header", Symbols: map[string]rspamc.Symbol{"TEST": {}}, MessageID: "test1"},
+			setupImapMock: func(t *testing.T, mockImap *MockImapClient, rsResult *rspamc.Result, rawEmail []byte) *mockAppendCmd {
+				mockImap.SelectFunc = func(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
+					cmd := imapclient.NewSelectCommand(nil)
+					isScanMailbox := mailbox == "Scan" // Assuming "Scan" is the scan mailbox from newTestClientWithConfig
+					isReadOnly := options != nil && options.ReadOnly
+
+					// First select is ReadOnly for initial check, second for ReadWrite for delete
+					if isScanMailbox && !isReadOnly && mockImap.SelectedMailbox == "Scan" { // This is the re-select for delete
+						go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 1}); cmd.Close() }()
+					} else if isScanMailbox && isReadOnly { // Initial select
+						go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 1, UIDNext: 2}); cmd.Close() }()
+					} else { // Other selects (e.g. for LearnSpam, Ham)
+						go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 0}); cmd.Close() }()
+					}
+					return cmd
+				}
+				mockImap.FetchFunc = func(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand {
+					cmd := imapclient.NewFetchCommand(nil)
+					go func() {
+						msg := imapclient.NewFetchMessageData(1, options)
+						msg.SetUID(1)
+						msg.SetEnvelope(&imap.Envelope{Subject: "Test"})
+						msg.SetRFC822(rawEmail)
+						cmd.AddMessage(msg)
+						cmd.Close()
+					}()
+					return cmd
+				}
+
+				mcmd := &mockAppendCmd{AppendCommand: imapclient.NewAppendCommand(nil, "",0,nil)}
+				mockImap.AppendFunc = func(mailbox string, size uint32, options *imap.AppendOptions) *imapclient.AppendCommand {
+					mcmd.AppendedToMailbox = mailbox // Capture for validation
+					return mcmd.AppendCommand
+				}
+				mockImap.StoreFunc = func(uidSet imap.UIDSet, flags imap.StoreFlagsOp, newFlags []imap.Flag, options *imap.StoreOptions) *imapclient.StoreCommand {
+					cmd := imapclient.NewStoreCommand(nil, uidSet, flags, newFlags, options)
+					go func() { cmd.Close() }()
+					return cmd
+				}
+				mockImap.ExpungeFunc = func(uidSet *imap.UIDSet) *imapclient.ExpungeCommand {
+					cmd := imapclient.NewExpungeCommand(nil, uidSet)
+					go func() { cmd.SetData(&imap.ExpungeData{UIDs: []imap.UID{1}}); cmd.Close() }()
+					return cmd
+				}
+				return mcmd
+			},
+			validateImapMock: func(t *testing.T, mockImap *MockImapClient, appendedCmd *mockAppendCmd, rsResult *rspamc.Result) {
+				if mockImap.AppendedToMailbox != "Inbox" { // Assuming InboxMailbox is "Inbox"
+					t.Errorf("Expected append to 'Inbox', got '%s'", mockImap.AppendedToMailbox)
+				}
+				expectedHeaders := rsResult.GetHeadersToApply()
+				if !emailContainsHeaders(t, appendedCmd.writtenData.Bytes(), expectedHeaders) {
+					// emailContainsHeaders will log specific missing headers
+				}
+				if len(mockImap.StoredUIDSet) != 1 || mockImap.StoredUIDSet.Nums()[0] != 1 {
+					t.Errorf("Expected Store for UID 1, got %v", mockImap.StoredUIDSet)
+				}
+				if mockImap.StoredFlagsOp != imap.StoreFlagsAdd || !reflect.DeepEqual(mockImap.StoredNewFlags, []imap.Flag{imap.FlagDeleted}) {
+					t.Errorf("Expected Store with +FLAGS (\\Deleted), got op %v flags %v", mockImap.StoredFlagsOp, mockImap.StoredNewFlags)
+				}
+				if mockImap.ExpungedUIDSet != nil { // nil means all in selected mailbox that are \Deleted
+					t.Error("Expected Expunge to be for all marked messages (nil UIDSet)")
+				}
+				if mockImap.MovedUIDSet != nil {
+					t.Errorf("Move should not have been called, but was for UIDs %v", mockImap.MovedUIDSet)
+				}
+			},
+			expectedFinalUID: 1,
+		},
+		// Add more test cases here:
+		// - Score = 0 (normal move to Inbox)
+		// - Score >= Threshold (normal move to Spam)
+		// - Header addition fails (parsing error) -> fallback to move
+		// - GetHeadersToApply returns empty map -> fallback to move
+		{
+			name:             "Score = 0 (Normal move to Inbox)",
+			initialState:     &SeenStatus{UIDValidity: 1, UIDLastProcessed: 0},
+			spamThreshold:    5.0,
+			mockRspamcResult: &rspamc.Result{Score: 0.0, Action: "no action"},
+			setupImapMock: func(t *testing.T, mockImap *MockImapClient, rsResult *rspamc.Result, rawEmail []byte) *mockAppendCmd {
+				mockImap.SelectFunc = func(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
+					cmd := imapclient.NewSelectCommand(nil)
+					go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 1, UIDNext: 2}); cmd.Close() }()
+					return cmd
+				}
+				mockImap.FetchFunc = func(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand {
+					cmd := imapclient.NewFetchCommand(nil)
+					go func() {
+						msg := imapclient.NewFetchMessageData(1, options)
+						msg.SetUID(1)
+						msg.SetEnvelope(&imap.Envelope{Subject: "Clean Email"})
+						msg.SetRFC822(rawEmail)
+						cmd.AddMessage(msg)
+						cmd.Close()
+					}()
+					return cmd
+				}
+				mockImap.MoveFunc = func(uidSet imap.UIDSet, dest string) *imapclient.MoveCommand {
+					cmd := imapclient.NewMoveCommand(nil, uidSet, dest)
+					go func() { cmd.Close() }()
+					return cmd
+				}
+				return nil // No append expected
+			},
+			validateImapMock: func(t *testing.T, mockImap *MockImapClient, appendedCmd *mockAppendCmd, rsResult *rspamc.Result) {
+				if mockImap.AppendedToMailbox != "" {
+					t.Errorf("Append should not have been called, but was to '%s'", mockImap.AppendedToMailbox)
+				}
+				if mockImap.MovedUIDSet == nil || len(mockImap.MovedUIDSet.Nums()) != 1 || mockImap.MovedUIDSet.Nums()[0] != 1 {
+					t.Errorf("Expected Move for UID 1, got %v", mockImap.MovedUIDSet)
+				}
+				if mockImap.MovedDest != "Inbox" {
+					t.Errorf("Expected Move to 'Inbox', got '%s'", mockImap.MovedDest)
+				}
+				if mockImap.StoredUIDSet != nil {
+					t.Errorf("Store should not have been called, but was for %v", mockImap.StoredUIDSet)
+				}
+			},
+			expectedFinalUID: 1,
+		},
+		{
+			name:             "Score >= Threshold (Normal move to Spam)",
+			initialState:     &SeenStatus{UIDValidity: 1, UIDLastProcessed: 0},
+			spamThreshold:    5.0,
+			mockRspamcResult: &rspamc.Result{Score: 10.0, Action: "reject"},
+			setupImapMock: func(t *testing.T, mockImap *MockImapClient, rsResult *rspamc.Result, rawEmail []byte) *mockAppendCmd {
+				mockImap.SelectFunc = func(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
+					cmd := imapclient.NewSelectCommand(nil)
+					go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 1, UIDNext: 2}); cmd.Close() }()
+					return cmd
+				}
+				mockImap.FetchFunc = func(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand {
+					cmd := imapclient.NewFetchCommand(nil)
+					go func() {
+						msg := imapclient.NewFetchMessageData(1, options)
+						msg.SetUID(1)
+						msg.SetEnvelope(&imap.Envelope{Subject: "Spam Email"})
+						msg.SetRFC822(rawEmail)
+						cmd.AddMessage(msg)
+						cmd.Close()
+					}()
+					return cmd
+				}
+				mockImap.MoveFunc = func(uidSet imap.UIDSet, dest string) *imapclient.MoveCommand {
+					cmd := imapclient.NewMoveCommand(nil, uidSet, dest)
+					go func() { cmd.Close() }()
+					return cmd
+				}
+				return nil // No append expected
+			},
+			validateImapMock: func(t *testing.T, mockImap *MockImapClient, appendedCmd *mockAppendCmd, rsResult *rspamc.Result) {
+				if mockImap.AppendedToMailbox != "" {
+					t.Errorf("Append should not have been called, but was to '%s'", mockImap.AppendedToMailbox)
+				}
+				if mockImap.MovedUIDSet == nil || len(mockImap.MovedUIDSet.Nums()) != 1 || mockImap.MovedUIDSet.Nums()[0] != 1 {
+					t.Errorf("Expected Move for UID 1, got %v", mockImap.MovedUIDSet)
+				}
+				if mockImap.MovedDest != "Spam" {
+					t.Errorf("Expected Move to 'Spam', got '%s'", mockImap.MovedDest)
+				}
+			},
+			expectedFinalUID: 1,
+		},
+		{
+			name:             "Header addition fails (parsing error) -> fallback to move",
+			initialState:     &SeenStatus{UIDValidity: 1, UIDLastProcessed: 0},
+			spamThreshold:    5.0,
+			mockRspamcResult: &rspamc.Result{Score: 2.0, Action: "add header"}, // Score indicates modification
+			setupImapMock: func(t *testing.T, mockImap *MockImapClient, rsResult *rspamc.Result, rawEmail []byte) *mockAppendCmd {
+				mockImap.SelectFunc = func(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
+					cmd := imapclient.NewSelectCommand(nil)
+					go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 1, UIDNext: 2}); cmd.Close() }()
+					return cmd
+				}
+				mockImap.FetchFunc = func(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand {
+					cmd := imapclient.NewFetchCommand(nil)
+					go func() {
+						msg := imapclient.NewFetchMessageData(1, options)
+						msg.SetUID(1)
+						msg.SetEnvelope(&imap.Envelope{Subject: "Malformed Email"})
+						// Provide malformed email that message.Read will fail on
+						msg.SetRFC822([]byte("From: test\nThis is not a valid email body due to missing headers or structure"))
+						cmd.AddMessage(msg)
+						cmd.Close()
+					}()
+					return cmd
+				}
+				mockImap.MoveFunc = func(uidSet imap.UIDSet, dest string) *imapclient.MoveCommand {
+					cmd := imapclient.NewMoveCommand(nil, uidSet, dest)
+					go func() { cmd.Close() }()
+					return cmd
+				}
+				return nil // No successful append expected
+			},
+			validateImapMock: func(t *testing.T, mockImap *MockImapClient, appendedCmd *mockAppendCmd, rsResult *rspamc.Result) {
+				if mockImap.AppendedToMailbox != "" {
+					t.Errorf("Append should not have been called due to parsing error, but was to '%s'", mockImap.AppendedToMailbox)
+				}
+				if mockImap.MovedUIDSet == nil || len(mockImap.MovedUIDSet.Nums()) != 1 || mockImap.MovedUIDSet.Nums()[0] != 1 {
+					t.Errorf("Expected Move for UID 1 (fallback), got %v", mockImap.MovedUIDSet)
+				}
+				if mockImap.MovedDest != "Inbox" {
+					t.Errorf("Expected fallback Move to 'Inbox', got '%s'", mockImap.MovedDest)
+				}
+			},
+			expectedError:    true, // Expecting an error because parsing fails and is added to errs
+			expectedFinalUID: 1,
+		},
+		{
+			name:          "GetHeadersToApply returns empty map -> fallback to move",
+			initialState:  &SeenStatus{UIDValidity: 1, UIDLastProcessed: 0},
+			spamThreshold: 5.0,
+			// RspamcResult will have Score that triggers modification path, but GetHeadersToApply will yield no headers
+			// This is simulated by having an empty Action, Symbols, etc. and MilterHeaders
+			mockRspamcResult: &rspamc.Result{Score: 1.0, Action: "", Symbols: map[string]rspamc.Symbol{}, Milter: rspamc.MilterHeaders{}},
+			setupImapMock: func(t *testing.T, mockImap *MockImapClient, rsResult *rspamc.Result, rawEmail []byte) *mockAppendCmd {
+				mockImap.SelectFunc = func(mailbox string, options *imap.SelectOptions) *imapclient.SelectCommand {
+					cmd := imapclient.NewSelectCommand(nil)
+					go func() { cmd.SetData(&imap.SelectData{UIDValidity: 1, NumMessages: 1, UIDNext: 2}); cmd.Close() }()
+					return cmd
+				}
+				mockImap.FetchFunc = func(numSet imap.NumSet, options *imap.FetchOptions) *imapclient.FetchCommand {
+					cmd := imapclient.NewFetchCommand(nil)
+					go func() {
+						msg := imapclient.NewFetchMessageData(1, options)
+						msg.SetUID(1)
+						msg.SetEnvelope(&imap.Envelope{Subject: "Normal Email"})
+						msg.SetRFC822(rawEmail)
+						cmd.AddMessage(msg)
+						cmd.Close()
+					}()
+					return cmd
+				}
+				mockImap.MoveFunc = func(uidSet imap.UIDSet, dest string) *imapclient.MoveCommand {
+					cmd := imapclient.NewMoveCommand(nil, uidSet, dest)
+					go func() { cmd.Close() }()
+					return cmd
+				}
+				return nil // No append expected
+			},
+			validateImapMock: func(t *testing.T, mockImap *MockImapClient, appendedCmd *mockAppendCmd, rsResult *rspamc.Result) {
+				if mockImap.AppendedToMailbox != "" {
+					t.Errorf("Append should not have been called, but was to '%s'", mockImap.AppendedToMailbox)
+				}
+				if mockImap.MovedUIDSet == nil || len(mockImap.MovedUIDSet.Nums()) != 1 || mockImap.MovedUIDSet.Nums()[0] != 1 {
+					t.Errorf("Expected Move for UID 1 (fallback), got %v", mockImap.MovedUIDSet)
+				}
+				if mockImap.MovedDest != "Inbox" {
+					t.Errorf("Expected fallback Move to 'Inbox', got '%s'", mockImap.MovedDest)
+				}
+			},
+			expectedFinalUID: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockImap := &MockImapClient{}
+			mockRspamc := &MockRspamcClient{
+				CheckFunc: func(ctx context.Context, msg io.Reader) (*rspamc.Result, error) {
+					return tt.mockRspamcResult, tt.mockRspamcError
+				},
+			}
+
+			clientCfg := ClientConfig{
+				ScanMailbox:   "Scan",
+				InboxMailbox:  "Inbox",
+				SpamMailbox:   "Spam",
+				SpamThreshold: tt.spamThreshold,
+				StatefilePath: t.TempDir() + "/teststate.json", // Each test gets its own state file
+			}
+			client := newTestClientWithConfig(mockImap, mockRspamc, clientCfg)
+
+			var appendedCmd *mockAppendCmd
+			if tt.setupImapMock != nil {
+				appendedCmd = tt.setupImapMock(t, mockImap, tt.mockRspamcResult, defaultRawEmail)
+			}
+
+			// Create initial state file if needed by loadOrCreateState
+			initState := &state{Seen: map[string]*SeenStatus{clientCfg.ScanMailbox: tt.initialState}}
+			if err := initState.ToFile(clientCfg.StatefilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Failed to write initial state file: %v", err)
+			}
+
+
+			finalState, err := client.ProcessScanBox(tt.initialState)
+
+			if tt.expectedError {
+				if err == nil {
+					t.Errorf("Expected an error, but got nil")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if finalState == nil {
+				t.Fatal("finalState should not be nil")
+			}
+			if finalState.UIDLastProcessed != tt.expectedFinalUID {
+				t.Errorf("Expected final UIDLastProcessed to be %d, got %d", tt.expectedFinalUID, finalState.UIDLastProcessed)
+			}
+
+			if tt.validateImapMock != nil {
+				tt.validateImapMock(t, mockImap, appendedCmd, tt.mockRspamcResult)
+			}
+		})
+	}
+}
+
 
 func TestLoadOrCreateState(t *testing.T) {
 	// Basic test structure for loadOrCreateState if it were to be tested here or expanded
@@ -427,10 +885,13 @@ func TestLoadOrCreateState(t *testing.T) {
 		// Test 1: File does not exist (or is empty), state should be created
 		// Forcing IsNotExist by using a non-existent path temporarily for this part of the test
 		// or ensuring the temp file is empty.
-		
+
 		// To simulate a truly non-existent file for the IsNotExist branch:
-		nonExistentPath := tmpFile.Name() + ".nonexistent"
+		// Ensure the file does not exist before calling.
+		nonExistentPath := filepath.Join(t.TempDir(), "nonexistent.json") // Use TempDir for safety
 		c.statefilePath = nonExistentPath
+		os.Remove(nonExistentPath) // Ensure it's gone
+
 
 		state, err := c.loadOrCreateState()
 		if err != nil {

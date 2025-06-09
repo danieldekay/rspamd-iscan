@@ -14,6 +14,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-message"
 )
 
 const defChanBufSiz = 32
@@ -438,16 +439,17 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 	numSet := imap.UIDSet{}
 	numSet.AddRange(status.UIDLastProcessed+1, 0)
 
-	fetchCmd := c.clt.Fetch(numSet, &imap.FetchOptions{
+	fetchOpts := &imap.FetchOptions{
+		UID:      true,
 		Envelope: true,
-		BodySection: []*imap.FetchItemBodySection{
-			{},
-		},
-	})
+		RFC822:   true, // Fetch full raw message
+	}
+	fetchCmd := c.clt.Fetch(numSet, fetchOpts)
 	defer fetchCmd.Close()
 
 	inboxSeqSet := imap.UIDSet{}
 	spamSeqSet := imap.UIDSet{}
+	uidsToDelete := imap.UIDSet{}
 
 	var errs []error
 	for {
@@ -458,48 +460,100 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 
 		msg, err := msgData.Collect()
 		if err != nil {
-			return &status, err
-		}
-		if msg.Envelope == nil {
-			return startStatus, errors.New("msg.Envelope is nil")
+			errs = append(errs, fmt.Errorf("collecting message data for UID range %v failed: %w", numSet, err))
+			break // General fetch error, stop processing this batch
 		}
 
 		if msg.UID == 0 {
-			return startStatus, errors.New("msg UID is nil")
+			logger.Warn("fetched message with UID 0, skipping")
+			continue
 		}
 
-		logger := c.logger.With("mail.subject", msg.Envelope.Subject, "mail.uid", msg.UID)
-		logger.Debug("fetched message")
+		msgLogger := logger.With("mail.uid", msg.UID)
+		if msg.Envelope != nil {
+			msgLogger = msgLogger.With("mail.subject", msg.Envelope.Subject)
+		}
+		msgLogger.Debug("fetched message")
 
-		if len(msg.BodySection) != 1 {
-			return startStatus, fmt.Errorf("msg has %d body sections, expecting 1", len(msg.BodySection))
-		}
-		var txt []byte
-		for _, b := range msg.BodySection {
-			txt = b
-			break
-		}
-		if txt == nil {
-			return startStatus, errors.New("body is nil")
-		}
-		if len(txt) == 0 {
-			return startStatus, errors.New("body is empty")
+		rawMsgBytes := msg.GetRFC822()
+		if rawMsgBytes == nil {
+			msgLogger.Error("message has nil RFC822 body, skipping")
+			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
+			continue
 		}
 
-		// TODO: retry Check if it failed with an temporary error
-		scanResult, err := c.rspamc.Check(context.Background(), bytes.NewReader(txt))
+		scanResult, err := c.rspamc.Check(context.Background(), bytes.NewReader(rawMsgBytes))
 		if err != nil {
-			// TODO: if an error happens, try to move the ones that
-			// we already scanned
-			return startStatus, err
+			msgLogger.Error("rspamc.Check failed", "error", err)
+			errs = append(errs, fmt.Errorf("rspamc.Check for UID %d failed: %w", msg.UID, err))
+			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
+			continue
 		}
-		logger = logger.With("scan.result", scanResult.Action, "scan.score", scanResult.Score, "scan.skipped", scanResult.IsSkipped)
-		logger.Debug("message scanned", "scan.symbols", scanResult.Symbols)
+		msgLogger = msgLogger.With("scan.result", scanResult.Action, "scan.score", scanResult.Score, "scan.skipped", scanResult.IsSkipped)
+		msgLogger.Debug("message scanned", "scan.symbols", scanResult.Symbols)
 
-		switch v := scanResult.Score; {
-		case v >= c.spamTreshold:
+		// Conditional Header Addition Logic
+		if scanResult.Score > 0 && scanResult.Score < c.spamTreshold {
+			headersToApply := scanResult.GetHeadersToApply()
+			if len(headersToApply) > 0 {
+				msgLogger.Debug("attempting to add headers and append to inbox", "headers_count", len(headersToApply))
+				parsedMsg, pErr := message.Read(bytes.NewReader(rawMsgBytes))
+				if pErr != nil {
+					msgLogger.Error("parsing raw message failed, falling back to simple move", "error", pErr)
+					errs = append(errs, fmt.Errorf("parsing UID %d failed: %w", msg.UID, pErr))
+					inboxSeqSet.AddNum(msg.UID)
+				} else {
+					for name, value := range headersToApply {
+						parsedMsg.Header.Set(name, value)
+						msgLogger.Debug("set header", "name", name, "value", value)
+					}
+					var buf bytes.Buffer
+					if wErr := parsedMsg.WriteTo(&buf); wErr != nil {
+						msgLogger.Error("serializing modified message failed, falling back to simple move", "error", wErr)
+						errs = append(errs, fmt.Errorf("serializing UID %d failed: %w", msg.UID, wErr))
+						inboxSeqSet.AddNum(msg.UID)
+					} else {
+						modifiedMsgBytes := buf.Bytes()
+						appendCmd := c.clt.Append(c.inboxMailbox, uint32(len(modifiedMsgBytes)), &imap.AppendOptions{})
+
+						opFailed := false
+						if _, err := appendCmd.Write(modifiedMsgBytes); err != nil {
+							msgLogger.Error("writing appended message to inbox failed", "error", err)
+							errs = append(errs, fmt.Errorf("writing append for UID %d to %s failed: %w", msg.UID, c.inboxMailbox, err))
+							opFailed = true
+						}
+						// Only close if write succeeded, otherwise close might also error due to bad state
+						if !opFailed {
+							if err := appendCmd.Close(); err != nil {
+								msgLogger.Error("closing append command for inbox failed", "error", err)
+								errs = append(errs, fmt.Errorf("closing append for UID %d to %s failed: %w", msg.UID, c.inboxMailbox, err))
+								opFailed = true
+							}
+						}
+						// Only wait if close succeeded (or if write failed, wait might also fail or hang)
+						if !opFailed {
+							if err := appendCmd.Wait(); err != nil {
+								msgLogger.Error("waiting for append command for inbox failed", "error", err)
+								errs = append(errs, fmt.Errorf("waiting append for UID %d to %s failed: %w", msg.UID, c.inboxMailbox, err))
+								opFailed = true
+							}
+						}
+
+						if opFailed {
+							inboxSeqSet.AddNum(msg.UID) // Fallback to simple move
+						} else {
+							msgLogger.Info("successfully appended modified message to inbox", "mailbox.destination", c.inboxMailbox)
+							uidsToDelete.AddNum(msg.UID)
+						}
+					}
+				}
+			} else {
+				msgLogger.Debug("no headers to apply, adding to inbox move set")
+				inboxSeqSet.AddNum(msg.UID)
+			}
+		} else if scanResult.Score >= c.spamTreshold {
 			spamSeqSet.AddNum(msg.UID)
-		default:
+		} else { // score <= 0
 			inboxSeqSet.AddNum(msg.UID)
 		}
 
@@ -508,36 +562,87 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		}
 	}
 
-	err = fetchCmd.Close()
-	if err != nil {
-		return startStatus, err
+	if err := fetchCmd.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("fetchCmd.Close failed: %w", err))
+		logger.Error("fetch command failed on close", "error", err)
 	}
 
+	// Move messages (not modified, or fallback)
 	if len(inboxSeqSet) > 0 {
-		_, err = c.clt.Move(inboxSeqSet, c.inboxMailbox).Wait()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("moving message to inbox mailbox failed: %w", err))
+		logger.Debug("moving messages to inbox", "count", len(inboxSeqSet), "uids", inboxSeqSet.String())
+		if _, err := c.clt.Move(inboxSeqSet, c.inboxMailbox).Wait(); err != nil {
+			errs = append(errs, fmt.Errorf("moving %d messages to inbox mailbox %q failed: %w", len(inboxSeqSet), c.inboxMailbox, err))
+			logger.Error("moving messages to inbox failed", "error", err, "mailbox", c.inboxMailbox, "count", len(inboxSeqSet))
 		} else {
-			logger.Info("moved messages to inbox", "mailbox.destination", c.inboxMailbox)
+			logger.Info("moved messages to inbox", "mailbox.destination", c.inboxMailbox, "count", len(inboxSeqSet))
 		}
 	}
-
 	if len(spamSeqSet) > 0 {
-		_, err = c.clt.Move(spamSeqSet, c.spamMailbox).Wait()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("moving message to spam mailbox failed: %w", err))
+		logger.Debug("moving messages to spam", "count", len(spamSeqSet), "uids", spamSeqSet.String())
+		if _, err := c.clt.Move(spamSeqSet, c.spamMailbox).Wait(); err != nil {
+			errs = append(errs, fmt.Errorf("moving %d messages to spam mailbox %q failed: %w", len(spamSeqSet), c.spamMailbox, err))
+			logger.Error("moving messages to spam failed", "error", err, "mailbox", c.spamMailbox, "count", len(spamSeqSet))
 		} else {
-			logger.Info("moved messages to spam mailbox", "mailbox.spam", c.spamMailbox)
+			logger.Info("moved messages to spam mailbox", "mailbox.destination", c.spamMailbox, "count", len(spamSeqSet))
 		}
 	}
 
-	if err := errors.Join(errs...); err != nil {
-		// we did not keep track of which mails were processed
-		// successfully and which wasn't, return startStatus to ensure
-		// the failed ones are processed again
-		return startStatus, err
+	// Delete successfully modified and appended messages from scanMailbox
+	if len(uidsToDelete) > 0 {
+		logger.Debug("deleting successfully modified and appended messages from scanMailbox", "count", len(uidsToDelete), "uids", uidsToDelete.String())
+		if _, err := c.clt.Select(c.scanMailbox, &imap.SelectOptions{ReadOnly: false}).Wait(); err != nil {
+			errs = append(errs, fmt.Errorf("re-selecting scanMailbox %q for delete failed: %w", c.scanMailbox, err))
+			logger.Error("re-selecting scanMailbox for delete failed", "error", err, "mailbox", c.scanMailbox)
+		} else {
+			storeCmd, err := c.clt.Store(uidsToDelete, imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("initiating store \\Deleted for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
+				logger.Error("initiating store \\Deleted failed", "error", err, "mailbox", c.scanMailbox)
+			} else {
+				sOpFailed := false
+				if err := storeCmd.Close(); err != nil {
+					errs = append(errs, fmt.Errorf("closing store \\Deleted command for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
+					logger.Error("closing store \\Deleted command failed", "error", err, "mailbox", c.scanMailbox)
+					sOpFailed = true
+				}
+				if !sOpFailed {
+					if err := storeCmd.Wait(); err != nil {
+						errs = append(errs, fmt.Errorf("waiting for store \\Deleted for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
+						logger.Error("waiting for store \\Deleted failed", "error", err, "mailbox", c.scanMailbox)
+						sOpFailed = true
+					}
+				}
+
+				if !sOpFailed {
+					logger.Info("marked messages for deletion in scanMailbox", "count", len(uidsToDelete))
+					expungeCmd, err := c.clt.Expunge(nil)
+					if err != nil {
+						errs = append(errs, fmt.Errorf("initiating expunge in %q failed: %w", c.scanMailbox, err))
+						logger.Error("initiating expunge failed", "error", err, "mailbox", c.scanMailbox)
+					} else {
+						eOpFailed := false
+						if err := expungeCmd.Close(); err != nil {
+							errs = append(errs, fmt.Errorf("closing expunge command in %q failed: %w", c.scanMailbox, err))
+							logger.Error("closing expunge command failed", "error", err, "mailbox", c.scanMailbox)
+							eOpFailed = true
+						}
+						if !eOpFailed {
+							if expungeData, err := expungeCmd.Wait(); err != nil {
+								errs = append(errs, fmt.Errorf("waiting for expunge in %q failed: %w", c.scanMailbox, err))
+								logger.Error("waiting for expunge failed", "error", err, "mailbox", c.scanMailbox)
+							} else {
+								logger.Info("expunged messages from scanMailbox", "expunged_count", len(expungeData.UIDs))
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
+	if len(errs) > 0 {
+		return &status, errors.Join(errs...)
+	}
 	return &status, nil
 }
 

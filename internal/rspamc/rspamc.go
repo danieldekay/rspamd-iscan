@@ -136,10 +136,130 @@ type Result struct {
 	Score     float32           `json:"score"`
 	IsSkipped bool              `json:"is_skipped"`
 	Symbols   map[string]Symbol `json:"symbols"`
+	// New fields for more detailed Rspamd information
+	RequiredScore float32       `json:"required_score"`
+	MessageID     string        `json:"message-id"`
+	Milter        MilterHeaders `json:"milter"`
+}
+
+// AddHeaderEntry defines the structure for individual header modifications by Milter.
+type AddHeaderEntry struct {
+	Value string `json:"value"`
+	Order int64  `json:"order"` // Assuming 'order' is an integer; if it can be float, float64 might be better.
+}
+
+// MilterHeaders defines the structure for Milter header modifications.
+type MilterHeaders struct {
+	AddHeaders map[string]AddHeaderEntry `json:"add_headers"`
+	// RemoveHeaders map[string]int64 `json:"remove_headers"` // Example for future extension
 }
 
 // https://rspamd.com/doc/architecture/protocol.html#protocol-basics
 type Symbol struct {
 	Name  string  `json:"name"`
 	Score float32 `json:"score"`
+}
+
+// GetHeadersToApply constructs a map of HTTP-like headers based on the Rspamd result.
+// Milter headers take precedence over standard constructed headers if names clash.
+func (r *Result) GetHeadersToApply() map[string]string {
+	headers := make(map[string]string)
+
+	// Process Milter Headers first
+	if r.Milter.AddHeaders != nil {
+		for name, entry := range r.Milter.AddHeaders {
+			headers[name] = entry.Value
+		}
+	}
+
+	// Construct Standard Headers only if score > 0
+	if r.Score > 0 {
+		// X-Spam-Flag
+		if _, exists := headers["X-Spam-Flag"]; !exists {
+			headers["X-Spam-Flag"] = "YES"
+		}
+
+		// X-Rspamd-Score
+		if _, exists := headers["X-Rspamd-Score"]; !exists {
+			headers["X-Rspamd-Score"] = fmt.Sprintf("%.2f", r.Score)
+		}
+
+		// X-Rspamd-Required-Score
+		if _, exists := headers["X-Rspamd-Required-Score"]; !exists {
+			// Only add if RequiredScore is meaningful (not zero, assuming zero means not set or not applicable)
+			// Rspamd might send 0.0 for some configurations, so this check might need adjustment
+			// based on typical Rspamd behavior. For now, any non-zero value is considered meaningful.
+			if r.RequiredScore != 0 {
+				headers["X-Rspamd-Required-Score"] = fmt.Sprintf("%.2f", r.RequiredScore)
+			}
+		}
+
+		// X-Spamd-Bar
+		if _, exists := headers["X-Spamd-Bar"]; !exists {
+			barLength := int(r.Score)
+			if r.Score > 0 && barLength == 0 { // For scores like 0.1 to 0.9, give one '+'
+				barLength = 1
+			}
+			const maxBarLength = 20
+			if barLength > maxBarLength {
+				barLength = maxBarLength
+			}
+			if barLength < 0 { // Should not happen with score > 0, but defensive
+				barLength = 0
+			}
+			bar := ""
+			for i := 0; i < barLength; i++ {
+				bar += "+"
+			}
+			if bar != "" { // Only add if there's something to show
+				headers["X-Spamd-Bar"] = bar
+			}
+		}
+
+		// X-Rspamd-Symbols
+		if _, exists := headers["X-Rspamd-Symbols"]; !exists {
+			if len(r.Symbols) > 0 {
+				symbolNames := make([]string, 0, len(r.Symbols))
+				for name := range r.Symbols {
+					symbolNames = append(symbolNames, name)
+				}
+				// Consider sorting symbolNames for consistent output if needed, though not specified.
+				headers["X-Rspamd-Symbols"] = fmt.Sprintf("%s", symbolNames) // Default Go string format for slice is not comma separated
+				// Correcting to join symbols with comma and space
+				symbolsStr := ""
+				for i, name := range symbolNames {
+					if i > 0 {
+						symbolsStr += ", "
+					}
+					symbolsStr += name
+				}
+				if symbolsStr != "" {
+					headers["X-Rspamd-Symbols"] = symbolsStr
+				}
+			}
+		}
+
+		// X-Rspamd-Action
+		if _, exists := headers["X-Rspamd-Action"]; !exists {
+			if r.Action != "" {
+				headers["X-Rspamd-Action"] = r.Action
+			}
+		}
+
+		// X-Rspamd-Message-ID
+		if _, exists := headers["X-Rspamd-Message-ID"]; !exists {
+			if r.MessageID != "" {
+				headers["X-Rspamd-Message-ID"] = r.MessageID
+			}
+		}
+	} else { // Handle r.Score <= 0 case for X-Spam-Flag if not set by Milter
+		if _, exists := headers["X-Spam-Flag"]; !exists {
+			// If score is 0 or less, and action is "no action" (or generally not spam)
+			// This part of the logic for "NO" was mentioned with "r.Score == 0 and r.Action == "no action""
+			// If score is <=0, it's generally "NO" unless Milter overrides.
+			headers["X-Spam-Flag"] = "NO"
+		}
+	}
+
+	return headers
 }

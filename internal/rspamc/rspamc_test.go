@@ -114,7 +114,7 @@ func TestSpam(t *testing.T) {
 					t.Fatalf("expected no error, got '%s'", err.Error())
 				}
 			}
-			
+
 			if tt.validateRequest != nil && actualRequest != nil {
 				tt.validateRequest(t, actualRequest, requestBodyStore)
 			} else if tt.validateRequest != nil && actualRequest == nil && tt.expectedError == "" {
@@ -132,7 +132,7 @@ func TestSpam(t *testing.T) {
 		// Here, the URL is formed as server.URL + "/learnspam". If server.URL is bad, it will fail.
 		// A truly malformed URL that http.NewRequestWithContext would catch might involve invalid characters.
 		// Let's use a client with an empty URL, which should lead to an error in NewRequestWithContext.
-		
+
 		client := New(logger, "%", "password") // "%" is an invalid URL character
 		err := client.Spam(context.Background(), strings.NewReader("test"))
 		if err == nil {
@@ -151,4 +151,190 @@ func TestSpam(t *testing.T) {
 			t.Errorf("expected error related to invalid URL or request creation, got: %s", err.Error())
 		}
 	})
+}
+
+func TestGetHeadersToApply(t *testing.T) {
+	tests := []struct {
+		name            string
+		result          Result
+		expectedHeaders map[string]string
+	}{
+		{
+			name: "Score > 0, No Milter Headers",
+			result: Result{
+				Score:         2.5,
+				RequiredScore: 5.0,
+				Action:        "add header",
+				Symbols: map[string]Symbol{
+					"TEST_SYMBOL": {Name: "TEST_SYMBOL", Score: 1.0},
+					"ANOTHER_S":   {Name: "ANOTHER_S", Score: 1.5},
+				},
+				MessageID: "testmsg123",
+				Milter:    MilterHeaders{}, // Empty
+			},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag":             "YES",
+				"X-Rspamd-Score":          "2.50",
+				"X-Rspamd-Required-Score": "5.00",
+				"X-Spamd-Bar":             "++",
+				"X-Rspamd-Symbols":        "TEST_SYMBOL, ANOTHER_S", // Order might vary, handle in check
+				"X-Rspamd-Action":         "add header",
+				"X-Rspamd-Message-ID":     "testmsg123",
+			},
+		},
+		{
+			name: "Score = 0, No Milter Headers",
+			result: Result{
+				Score:         0,
+				RequiredScore: 5.0,
+				Action:        "no action",
+				Milter:        MilterHeaders{},
+			},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag": "NO",
+			},
+		},
+		{
+			name: "Score < 0, No Milter Headers",
+			result: Result{
+				Score:         -1.0,
+				RequiredScore: 5.0,
+				Action:        "reject",
+				Milter:        MilterHeaders{},
+			},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag": "NO", // Score <= 0 means NO
+			},
+		},
+		{
+			name: "Score > 0, With Milter Headers (precedence)",
+			result: Result{
+				Score:         1.0,
+				RequiredScore: 5.0,
+				Action:        "greylist",
+				Symbols:       map[string]Symbol{"GREY": {Name: "GREY", Score: 1.0}},
+				Milter: MilterHeaders{
+					AddHeaders: map[string]AddHeaderEntry{
+						"X-Custom-Header": {Value: "custom_value"},
+						"X-Spam-Flag":     {Value: "OVERRIDDEN_FLAG"}, // Milter overrides
+						"X-Rspamd-Score":  {Value: "MILTER_SCORE"},    // Milter overrides
+					},
+				},
+			},
+			expectedHeaders: map[string]string{
+				"X-Custom-Header":         "custom_value",
+				"X-Spam-Flag":             "OVERRIDDEN_FLAG",
+				"X-Rspamd-Score":          "MILTER_SCORE",
+				"X-Rspamd-Required-Score": "5.00", // Not overridden by Milter
+				"X-Spamd-Bar":             "+",    // Not overridden
+				"X-Rspamd-Symbols":        "GREY", // Not overridden
+				"X-Rspamd-Action":         "greylist", // Not overridden
+			},
+		},
+		{
+			name:   "X-Spamd-Bar generation 0.5",
+			result: Result{Score: 0.5, Milter: MilterHeaders{}},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag": "YES",
+				"X-Spamd-Bar": "+", "X-Rspamd-Score": "0.50",
+			},
+		},
+		{
+			name:   "X-Spamd-Bar generation 3.0",
+			result: Result{Score: 3.0, Milter: MilterHeaders{}},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag": "YES",
+				"X-Spamd-Bar": "+++", "X-Rspamd-Score": "3.00",
+			},
+		},
+		{
+			name:   "X-Spamd-Bar generation 22.0 (max 20)",
+			result: Result{Score: 22.0, Milter: MilterHeaders{}},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag":    "YES",
+				"X-Spamd-Bar":    "++++++++++++++++++++",
+				"X-Rspamd-Score": "22.00",
+			},
+		},
+		{
+			name: "Empty symbols, action, message-id, zero required_score",
+			result: Result{
+				Score:         1.5,
+				RequiredScore: 0, // Test case where this might be zero
+				Action:        "",
+				Symbols:       make(map[string]Symbol), // Empty
+				MessageID:     "",
+				Milter:        MilterHeaders{},
+			},
+			expectedHeaders: map[string]string{
+				"X-Spam-Flag": "YES",
+				"X-Rspamd-Score": "1.50",
+				"X-Spamd-Bar":    "+",
+				// X-Rspamd-Required-Score should NOT be present if RequiredScore is 0
+				// X-Rspamd-Symbols should NOT be present if Symbols is empty
+				// X-Rspamd-Action should NOT be present if Action is empty
+				// X-Rspamd-Message-ID should NOT be present if MessageID is empty
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := tt.result.GetHeadersToApply()
+
+			// Check X-Rspamd-Symbols separately due to map iteration order
+			expectedSymbolsVal, hasExpectedSymbols := tt.expectedHeaders["X-Rspamd-Symbols"]
+			actualSymbolsVal, hasActualSymbols := headers["X-Rspamd-Symbols"]
+
+			if hasExpectedSymbols {
+				if !hasActualSymbols {
+					t.Errorf("Expected header X-Rspamd-Symbols to be present, but it's missing")
+				} else {
+					// Compare symbol lists ignoring order
+					expectedSyms := strings.Split(expectedSymbolsVal, ", ")
+					actualSyms := strings.Split(actualSymbolsVal, ", ")
+					if len(expectedSyms) != len(actualSyms) {
+						t.Errorf("X-Rspamd-Symbols: expected %d symbols, got %d. Expected: '%s', Got: '%s'", len(expectedSyms), len(actualSyms), expectedSymbolsVal, actualSymbolsVal)
+					} else {
+						expectedMap := make(map[string]bool)
+						for _, s := range expectedSyms {
+							expectedMap[s] = true
+						}
+						for _, s := range actualSyms {
+							if !expectedMap[s] {
+								t.Errorf("X-Rspamd-Symbols: unexpected symbol '%s' found. Expected: '%s', Got: '%s'", s, expectedSymbolsVal, actualSymbolsVal)
+								break
+							}
+						}
+					}
+				}
+			} else if hasActualSymbols {
+				t.Errorf("Header X-Rspamd-Symbols should not be present, but got '%s'", actualSymbolsVal)
+			}
+			delete(headers, "X-Rspamd-Symbols") // remove for generic check below
+			delete(tt.expectedHeaders, "X-Rspamd-Symbols")
+
+
+			if len(headers) != len(tt.expectedHeaders) {
+				t.Errorf("Expected %d headers, got %d. \nExpected: %v, \nGot: %v", len(tt.expectedHeaders), len(headers), tt.expectedHeaders, headers)
+			}
+
+			for name, expectedValue := range tt.expectedHeaders {
+				actualValue, ok := headers[name]
+				if !ok {
+					t.Errorf("Expected header '%s' not found", name)
+					continue
+				}
+				if actualValue != expectedValue {
+					t.Errorf("For header '%s': expected '%s', got '%s'", name, expectedValue, actualValue)
+				}
+			}
+			// Check for unexpected headers
+			for name := range headers {
+				if _, ok := tt.expectedHeaders[name]; !ok {
+					t.Errorf("Unexpected header '%s' found in result", name)
+				}
+			}
+		})
+	}
 }
