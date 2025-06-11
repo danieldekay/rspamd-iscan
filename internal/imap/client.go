@@ -480,13 +480,18 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		msgLogger.Debug("fetched message")
 
 		// Correctly get raw message bytes using the literal corresponding to fetchItemFullBody
-		literal := msgData.BodySection(fetchItemFullBody)
-		if literal == nil {
-			msgLogger.Error("message literal for full body not found, skipping")
-			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
-			continue
+		var sectionBytes []byte
+		// Check if msg.BodySection map exists and then if fetchItemFullBody key exists
+		if msg.BodySection != nil {
+			sectionBytes = msg.BodySection[fetchItemFullBody]
 		}
-		rawMsgBytes, errRead := io.ReadAll(literal)
+
+		if sectionBytes == nil { // This effectively replaces `if literal == nil`
+			msgLogger.Error("message body section for full body not found, or section map was nil, skipping", "fetch_item", fetchItemFullBody)
+			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
+			continue // Make sure this 'continue' is within the 'for' loop of fetching messages
+		}
+		rawMsgBytes, errRead := io.ReadAll(bytes.NewReader(sectionBytes)) // Use bytes.NewReader
 		if errRead != nil {
 			msgLogger.Error("failed to read message literal", "error", errRead)
 			errs = append(errs, fmt.Errorf("reading literal for UID %d failed: %w", msg.UID, errRead))
