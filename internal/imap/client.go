@@ -446,7 +446,7 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		Envelope:   true,
 		BodySection: []*imap.FetchItemBodySection{fetchItemFullBody},
 	}
-	fetchCmd := c.clt.Fetch(numSet.Set(), fetchOpts)
+	fetchCmd := c.clt.Fetch(numSet, fetchOpts)
 	defer fetchCmd.Close()
 
 	inboxSeqSet := imap.UIDSet{}
@@ -462,7 +462,8 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 
 		msg, err := msgData.Collect() // msg is *imap.MessageData
 		if err != nil {
-			errs = append(errs, fmt.Errorf("collecting message data for UID range %v failed: %w", numSet.Set().String(), err))
+			// Use numSet directly in error message as well, since it's a NumSet.
+			errs = append(errs, fmt.Errorf("collecting message data for UID range %v failed: %w", numSet.String(), err))
 			break // General fetch error, stop processing this batch
 		}
 
