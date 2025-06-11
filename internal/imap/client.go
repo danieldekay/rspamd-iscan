@@ -637,9 +637,10 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 				// Corrected Expunge call: no arguments for all marked, and handle command pattern
 				expungeCmd := c.clt.Expunge()
 				// Expunge command itself doesn't return error on initiation
-				if expungeData, err := expungeCmd.Wait(); err != nil { // Check error after Wait
-					errs = append(errs, fmt.Errorf("waiting for expunge in %q failed: %w", c.scanMailbox, err))
-					logger.Error("waiting for expunge failed", "error", err, "mailbox", c.scanMailbox)
+				expungeData := expungeCmd.Wait()
+				if expungeData == nil {
+					errs = append(errs, fmt.Errorf("waiting for expunge in %q failed (result was nil)", c.scanMailbox))
+					logger.Error("waiting for expunge failed (result was nil)", "mailbox", c.scanMailbox)
 				} else {
 					logger.Info("expunged messages from scanMailbox", "expunged_count", len(expungeData.UIDs))
 				}
