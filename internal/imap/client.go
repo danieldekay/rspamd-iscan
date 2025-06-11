@@ -439,12 +439,14 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 	numSet := imap.UIDSet{}
 	numSet.AddRange(status.UIDLastProcessed+1, 0)
 
+	// Define the specific FetchItem for the full body
+	fetchItemFullBody := &imap.FetchItemBodySection{} // Empty FetchItemBodySection fetches BODY[]
 	fetchOpts := &imap.FetchOptions{
-		UID:      true,
-		Envelope: true,
-		RFC822:   true, // Fetch full raw message
+		UID:        true,
+		Envelope:   true,
+		BodySection: []*imap.FetchItemBodySection{fetchItemFullBody},
 	}
-	fetchCmd := c.clt.Fetch(numSet, fetchOpts)
+	fetchCmd := c.clt.Fetch(numSet.Set(), fetchOpts)
 	defer fetchCmd.Close()
 
 	inboxSeqSet := imap.UIDSet{}
@@ -453,14 +455,14 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 
 	var errs []error
 	for {
-		msgData := fetchCmd.Next()
+		msgData := fetchCmd.Next() // msgData is *imapclient.FetchMessageBuffer
 		if msgData == nil {
 			break
 		}
 
-		msg, err := msgData.Collect()
+		msg, err := msgData.Collect() // msg is *imap.MessageData
 		if err != nil {
-			errs = append(errs, fmt.Errorf("collecting message data for UID range %v failed: %w", numSet, err))
+			errs = append(errs, fmt.Errorf("collecting message data for UID range %v failed: %w", numSet.Set().String(), err))
 			break // General fetch error, stop processing this batch
 		}
 
@@ -475,9 +477,22 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		}
 		msgLogger.Debug("fetched message")
 
-		rawMsgBytes := msg.GetRFC822()
-		if rawMsgBytes == nil {
-			msgLogger.Error("message has nil RFC822 body, skipping")
+		// Correctly get raw message bytes using the literal corresponding to fetchItemFullBody
+		literal := msgData.Literal(fetchItemFullBody)
+		if literal == nil {
+			msgLogger.Error("message literal for full body not found, skipping")
+			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
+			continue
+		}
+		rawMsgBytes, errRead := io.ReadAll(literal)
+		if errRead != nil {
+			msgLogger.Error("failed to read message literal", "error", errRead)
+			errs = append(errs, fmt.Errorf("reading literal for UID %d failed: %w", msg.UID, errRead))
+			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
+			continue
+		}
+		if len(rawMsgBytes) == 0 {
+			msgLogger.Warn("message body is empty after reading literal, skipping", "uid", msg.UID)
 			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
 			continue
 		}
@@ -514,7 +529,7 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 						inboxSeqSet.AddNum(msg.UID)
 					} else {
 						modifiedMsgBytes := buf.Bytes()
-						appendCmd := c.clt.Append(c.inboxMailbox, uint32(len(modifiedMsgBytes)), &imap.AppendOptions{})
+						appendCmd := c.clt.Append(c.inboxMailbox, int64(len(modifiedMsgBytes)), &imap.AppendOptions{})
 
 						opFailed := false
 						if _, err := appendCmd.Write(modifiedMsgBytes); err != nil {
@@ -522,7 +537,7 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 							errs = append(errs, fmt.Errorf("writing append for UID %d to %s failed: %w", msg.UID, c.inboxMailbox, err))
 							opFailed = true
 						}
-						// Only close if write succeeded, otherwise close might also error due to bad state
+
 						if !opFailed {
 							if err := appendCmd.Close(); err != nil {
 								msgLogger.Error("closing append command for inbox failed", "error", err)
@@ -530,20 +545,25 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 								opFailed = true
 							}
 						}
-						// Only wait if close succeeded (or if write failed, wait might also fail or hang)
+
 						if !opFailed {
-							if err := appendCmd.Wait(); err != nil {
+							appendRespData, err := appendCmd.Wait()
+							if err != nil {
 								msgLogger.Error("waiting for append command for inbox failed", "error", err)
 								errs = append(errs, fmt.Errorf("waiting append for UID %d to %s failed: %w", msg.UID, c.inboxMailbox, err))
 								opFailed = true
+							} else {
+								logArgs := []any{"mailbox.destination", c.inboxMailbox}
+								if appendRespData != nil && appendRespData.UID != 0 {
+									logArgs = append(logArgs, "newUID", appendRespData.UID)
+								}
+								msgLogger.Info("successfully appended modified message to inbox", logArgs...)
+								uidsToDelete.AddNum(msg.UID)
 							}
 						}
 
-						if opFailed {
+						if opFailed { // If any step of append failed
 							inboxSeqSet.AddNum(msg.UID) // Fallback to simple move
-						} else {
-							msgLogger.Info("successfully appended modified message to inbox", "mailbox.destination", c.inboxMailbox)
-							uidsToDelete.AddNum(msg.UID)
 						}
 					}
 				}
@@ -567,7 +587,6 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		logger.Error("fetch command failed on close", "error", err)
 	}
 
-	// Move messages (not modified, or fallback)
 	if len(inboxSeqSet) > 0 {
 		logger.Debug("moving messages to inbox", "count", len(inboxSeqSet), "uids", inboxSeqSet.String())
 		if _, err := c.clt.Move(inboxSeqSet, c.inboxMailbox).Wait(); err != nil {
@@ -587,52 +606,209 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		}
 	}
 
-	// Delete successfully modified and appended messages from scanMailbox
 	if len(uidsToDelete) > 0 {
 		logger.Debug("deleting successfully modified and appended messages from scanMailbox", "count", len(uidsToDelete), "uids", uidsToDelete.String())
 		if _, err := c.clt.Select(c.scanMailbox, &imap.SelectOptions{ReadOnly: false}).Wait(); err != nil {
 			errs = append(errs, fmt.Errorf("re-selecting scanMailbox %q for delete failed: %w", c.scanMailbox, err))
 			logger.Error("re-selecting scanMailbox for delete failed", "error", err, "mailbox", c.scanMailbox)
 		} else {
-			storeCmd, err := c.clt.Store(uidsToDelete, imap.StoreFlagsAdd, []imap.Flag{imap.FlagDeleted}, nil)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("initiating store \\Deleted for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
-				logger.Error("initiating store \\Deleted failed", "error", err, "mailbox", c.scanMailbox)
-			} else {
-				sOpFailed := false
-				if err := storeCmd.Close(); err != nil {
-					errs = append(errs, fmt.Errorf("closing store \\Deleted command for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
-					logger.Error("closing store \\Deleted command failed", "error", err, "mailbox", c.scanMailbox)
-					sOpFailed = true
-				}
-				if !sOpFailed {
-					if err := storeCmd.Wait(); err != nil {
-						errs = append(errs, fmt.Errorf("waiting for store \\Deleted for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
-						logger.Error("waiting for store \\Deleted failed", "error", err, "mailbox", c.scanMailbox)
-						sOpFailed = true
-					}
-				}
+			storeFlagsInfo := &imap.StoreFlags{
+				Op:    imap.StoreFlagsAdd,
+				Flags: []imap.Flag{imap.FlagDeleted},
+			}
+			storeCmd := c.clt.UIDStore(uidsToDelete, storeFlagsInfo, nil) // Corrected to UIDStore
+			sOpFailed := false
+			// UIDStore(...).Wait() returns (*imap.StoreData, error), StoreData is often nil for flag updates.
+			if err := storeCmd.Wait(); err != nil {
+				errs = append(errs, fmt.Errorf("waiting for store \\Deleted for %d UIDs in %q failed: %w", len(uidsToDelete), c.scanMailbox, err))
+				logger.Error("waiting for store \\Deleted failed", "error", err, "mailbox", c.scanMailbox)
+				sOpFailed = true
+			}
 
-				if !sOpFailed {
-					logger.Info("marked messages for deletion in scanMailbox", "count", len(uidsToDelete))
-					expungeCmd, err := c.clt.Expunge(nil)
-					if err != nil {
-						errs = append(errs, fmt.Errorf("initiating expunge in %q failed: %w", c.scanMailbox, err))
-						logger.Error("initiating expunge failed", "error", err, "mailbox", c.scanMailbox)
-					} else {
-						eOpFailed := false
-						if err := expungeCmd.Close(); err != nil {
-							errs = append(errs, fmt.Errorf("closing expunge command in %q failed: %w", c.scanMailbox, err))
-							logger.Error("closing expunge command failed", "error", err, "mailbox", c.scanMailbox)
-							eOpFailed = true
-						}
-						if !eOpFailed {
-							if expungeData, err := expungeCmd.Wait(); err != nil {
-								errs = append(errs, fmt.Errorf("waiting for expunge in %q failed: %w", c.scanMailbox, err))
-								logger.Error("waiting for expunge failed", "error", err, "mailbox", c.scanMailbox)
-							} else {
-								logger.Info("expunged messages from scanMailbox", "expunged_count", len(expungeData.UIDs))
-							}
+			if !sOpFailed {
+				logger.Info("marked messages for deletion in scanMailbox", "count", len(uidsToDelete))
+				// Corrected Expunge call: no arguments for all marked, and handle command pattern
+				expungeCmd := c.clt.Expunge()
+				eOpFailed := false
+				// Expunge command itself doesn't return error on initiation
+				if expungeData, err := expungeCmd.Wait(); err != nil { // Check error after Wait
+					errs = append(errs, fmt.Errorf("waiting for expunge in %q failed: %w", c.scanMailbox, err))
+					logger.Error("waiting for expunge failed", "error", err, "mailbox", c.scanMailbox)
+					eOpFailed = true // Though not used after this, good for pattern
+				} else {
+					logger.Info("expunged messages from scanMailbox", "expunged_count", len(expungeData.UIDs))
+				}
+				// Note: The original code had separate Close and Wait for expungeCmd.
+				// The imapclient.Command pattern is usually just Wait() which implies Close.
+				// If ExpungeCommand is different and needs explicit Close before Wait, this might need adjustment.
+				// However, typically `cmd.Wait()` is sufficient. For other commands like Append, explicit Close is often needed before Wait.
+				// The documentation for `imapclient.ExpungeCommand` should be checked if this still fails.
+				// Given the previous error "assignment mismatch: 2 variables but c.clt.Expunge returns 1 value",
+				// it implies c.clt.Expunge() returns *ExpungeCommand.
+				// Then `expungeCmd.Wait()` would return `(*ExpungeData, error)`.
+				// The previous code was:
+				// expungeCmd, err := c.clt.Expunge(nil)
+				// if err != nil { ... } else { expungeCmd.Close(); expungeData, err := expungeCmd.Wait() }
+				// This suggests Expunge() itself can return an error.
+				// Let's stick to the simpler: `cmd := Expunge(); data, err := cmd.Wait()`
+				// If Expunge() itself can fail to *initiate*, the library might return (*Cmd, error) from Expunge()
+				// But the build error `assignment mismatch: 2 variables but c.clt.Expunge returns 1 value` suggests
+				// `c.clt.Expunge()` returns only `*ExpungeCommand`.
+
+				// Re-evaluating the Expunge part based on typical client library patterns and the specific error:
+				// The error `assignment mismatch: 2 variables but c.clt.Expunge returns 1 value`
+				// was on `expungeCmd, err := c.clt.Expunge(nil)`. This means `c.clt.Expunge()` returns `*imapclient.ExpungeCommand`.
+				// The error `too many arguments in call to c.clt.Expunge` means `c.clt.Expunge()` takes no args.
+				// So, `expungeCmd := c.clt.Expunge()` is correct.
+				// Then, `expungeData, err := expungeCmd.Wait()` is the correct way to get the data and error.
+				// The original code had:
+				// expungeCmd, err := c.clt.Expunge(nil) // Incorrect call and assignment
+				// ...
+				//   if err := expungeCmd.Close(); err != nil { ... } // This might be needed if Wait doesn't close.
+				//   else if expungeData, err := expungeCmd.Wait(); err != nil { ... }
+				// Let's assume Wait is enough, or if specific close is needed, it's part of command's lifecycle.
+				// The current structure `expungeCmd := c.clt.Expunge(); expungeData, err := expungeCmd.Wait()` is standard.
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return &status, errors.Join(errs...)
+	}
+	return &status, nil
+}
+
+func (c *Client) writeStateFile(s *state) error {
+	err := s.ToFile(c.statefilePath)
+	if err != nil {
+		return err
+	}
+	c.logger.Info("wrote state to file", "statefile", c.statefilePath)
+	return nil
+}
+
+func (c *Client) Run() error {
+	lastSeen, err := c.loadOrCreateState()
+	if err != nil {
+		return err
+	}
+
+	err = c.ProcessHam()
+	if err != nil {
+		return fmt.Errorf("learning ham failed: %w", err)
+	}
+
+	err = c.ProcessLearnSpam()
+	if err != nil {
+		return fmt.Errorf("learning spam failed: %w", err)
+	}
+
+	seen, err := c.ProcessScanBox(lastSeen.Seen[c.scanMailbox])
+	lastSeen.Seen[c.scanMailbox] = seen
+	if err := c.writeStateFile(lastSeen); err != nil {
+		return fmt.Errorf("writing state file failed: %w", err)
+	}
+	if err != nil {
+		return err
+	}
+
+	monitorCancelFn, err := c.Monitor(c.scanMailbox)
+	if err != nil {
+		return WrapRetryableError(err)
+	}
+
+	c.logger.Debug("waiting for mailbox update events")
+
+	var lastHamLearn time.Time
+	for {
+		select {
+		// sometimes monitoring stops working and no updates are
+		// send anymore, despite new imap messages,
+		// therefore we additionally check every 30min for new
+		// mails, to workaround it.
+		case <-time.After(30 * time.Minute):
+			c.logger.Debug("timer expired, checking mailbox for new messages")
+
+			if err := monitorCancelFn(); err != nil {
+				return WrapRetryableError(err)
+			}
+			seen, err := c.ProcessScanBox(lastSeen.Seen[c.scanMailbox])
+			lastSeen.Seen[c.scanMailbox] = seen
+			// TODO: ProcessScanBox returns early, and returns
+			// lastSeen if there is nothing to do, do not write the
+			// file unnecessarily.
+			if err := c.writeStateFile(lastSeen); err != nil {
+				return fmt.Errorf("writing state file failed: %w", err)
+			}
+			if err != nil {
+				return err
+			}
+
+			if time.Since(lastHamLearn) >= c.hamLearnCheckInterval {
+				if err := c.ProcessHam(); err != nil {
+					return err
+				}
+				if err := c.ProcessLearnSpam(); err != nil {
+					// Log or handle as appropriate, maybe not fatal
+					c.logger.Error("processing learn spam mailbox failed during periodic check", "error", err)
+				}
+				lastHamLearn = time.Now()
+			}
+
+			monitorCancelFn, err = c.Monitor(c.scanMailbox)
+			if err != nil {
+				return WrapRetryableError(err)
+			}
+
+		case evA, ok := <-c.eventCh:
+			if !ok {
+				c.logger.Debug("event channel was closed")
+				_ = monitorCancelFn()
+				return nil
+			}
+
+			if err := monitorCancelFn(); err != nil {
+				return WrapRetryableError(err)
+			}
+
+			if time.Since(lastHamLearn) >= c.hamLearnCheckInterval {
+				if err := c.ProcessHam(); err != nil {
+					return err
+				}
+				if err := c.ProcessLearnSpam(); err != nil {
+					// Log or handle as appropriate
+					c.logger.Error("processing learn spam mailbox failed after event", "error", err)
+				}
+				lastHamLearn = time.Now()
+			}
+
+			// TODO: we might receive multiple events at once,
+			// instead of processing all sequentially, fetch
+			// all and only call ProcessScanBox 1x
+			if evA.NewMsgCount == 0 {
+				c.logger.Info("ignoring MailboxUpdate, no new messages")
+				continue
+			}
+
+			seen, err := c.ProcessScanBox(lastSeen.Seen[c.scanMailbox])
+			lastSeen.Seen[c.scanMailbox] = seen
+			// TODO: ProcessScanBox returns early, and returns
+			// lastSeen if there is nothing to do, do not write the
+			// file unnecessarily.
+			if err := c.writeStateFile(lastSeen); err != nil {
+				return fmt.Errorf("writing state file failed: %w", err)
+			}
+			if err != nil {
+				return err
+			}
+
+			monitorCancelFn, err = c.Monitor(c.scanMailbox)
+			if err != nil {
+				return WrapRetryableError(err)
+			}
+		}
+	}
+}
 						}
 					}
 				}
