@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -479,7 +480,7 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 		msgLogger.Debug("fetched message")
 
 		// Correctly get raw message bytes using the literal corresponding to fetchItemFullBody
-		literal := msgData.Literal(fetchItemFullBody)
+		literal := msgData.BodySection(fetchItemFullBody)
 		if literal == nil {
 			msgLogger.Error("message literal for full body not found, skipping")
 			if msg.UID > status.UIDLastProcessed { status.UIDLastProcessed = msg.UID }
@@ -630,12 +631,10 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 				logger.Info("marked messages for deletion in scanMailbox", "count", len(uidsToDelete))
 				// Corrected Expunge call: no arguments for all marked, and handle command pattern
 				expungeCmd := c.clt.Expunge()
-				eOpFailed := false
 				// Expunge command itself doesn't return error on initiation
 				if expungeData, err := expungeCmd.Wait(); err != nil { // Check error after Wait
 					errs = append(errs, fmt.Errorf("waiting for expunge in %q failed: %w", c.scanMailbox, err))
 					logger.Error("waiting for expunge failed", "error", err, "mailbox", c.scanMailbox)
-					eOpFailed = true // Though not used after this, good for pattern
 				} else {
 					logger.Info("expunged messages from scanMailbox", "expunged_count", len(expungeData.UIDs))
 				}
