@@ -637,12 +637,12 @@ func (c *Client) ProcessScanBox(startStatus *SeenStatus) (*SeenStatus, error) {
 				// Corrected Expunge call: no arguments for all marked, and handle command pattern
 				expungeCmd := c.clt.Expunge()
 				// Expunge command itself doesn't return error on initiation
-				expungeData := expungeCmd.Wait()
-				if expungeData == nil {
-					errs = append(errs, fmt.Errorf("waiting for expunge in %q failed (result was nil)", c.scanMailbox))
-					logger.Error("waiting for expunge failed (result was nil)", "mailbox", c.scanMailbox)
+				errExpunge := expungeCmd.Wait() // Assign to an error variable
+				if errExpunge != nil {
+					errs = append(errs, fmt.Errorf("waiting for expunge in %q failed: %w", c.scanMailbox, errExpunge))
+					logger.Error("waiting for expunge failed", "error", errExpunge, "mailbox", c.scanMailbox)
 				} else {
-					logger.Info("expunged messages from scanMailbox", "expunged_count", len(expungeData.UIDs))
+					logger.Info("expunged messages from scanMailbox successfully (count not available with this library version)") // Generic success message
 				}
 				// Note: The original code had separate Close and Wait for expungeCmd.
 				// The imapclient.Command pattern is usually just Wait() which implies Close.
